@@ -23,6 +23,7 @@ class DateChunker(Chunker):
                   chunk_size, dataframe/series)
         """
         if 'date' in df.index.names:
+            # 也就是返回所有作为索引的的日期值
             dates = df.index.get_level_values('date')
             if not df.index.is_monotonic_increasing:
                 df = df.sort_index()
@@ -84,6 +85,7 @@ class DateChunker(Chunker):
         if isinstance(range_obj, (pd.DatetimeIndex, tuple)):
             range_obj = DateRange(range_obj[0], range_obj[-1])
         if range_obj.start and range_obj.end:
+            # 表示内部的两个逻辑是与的状态
             return {'$and': [{START: {'$lte': range_obj.end}}, {END: {'$gte': range_obj.start}}]}
         elif range_obj.start:
             return {END: {'$gte': range_obj.start}}

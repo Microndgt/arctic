@@ -14,7 +14,6 @@ from .tickstore import tickstore, toplevel
 from .chunkstore import chunkstore
 from six import string_types
 
-
 __all__ = ['Arctic', 'VERSION_STORE', 'METADATA_STORE', 'TICK_STORE', 'CHUNK_STORE', 'register_library_type']
 
 logger = logging.getLogger(__name__)
@@ -108,7 +107,7 @@ class Arctic(object):
             mongo_host.server_info()
             self.mongo_host = ",".join(["{}:{}".format(x[0], x[1]) for x in mongo_host.nodes])
             self._adminDB = self._conn.admin
-    
+
     @property
     @mongo_retry
     def _conn(self):
@@ -117,13 +116,14 @@ class Arctic(object):
                 host = get_mongodb_uri(self.mongo_host)
                 logger.info("Connecting to mongo: {0} ({1})".format(self.mongo_host, host))
                 self.__conn = pymongo.MongoClient(host=host,
-                                                   maxPoolSize=self._MAX_CONNS,
-                                                   socketTimeoutMS=self._socket_timeout,
-                                                   connectTimeoutMS=self._connect_timeout,
-                                                   serverSelectionTimeoutMS=self._server_selection_timeout)
+                                                  maxPoolSize=self._MAX_CONNS,
+                                                  socketTimeoutMS=self._socket_timeout,
+                                                  connectTimeoutMS=self._connect_timeout,
+                                                  serverSelectionTimeoutMS=self._server_selection_timeout)
                 self._adminDB = self.__conn.admin
 
                 # Authenticate against admin for the user
+                # 添加一个auth的hook即可添加身份认证
                 auth = get_auth(self.mongo_host, self._application_name, 'admin')
                 if auth:
                     authenticate(self._adminDB, auth.user, auth.password)
@@ -167,12 +167,16 @@ class Arctic(object):
         list of Arctic library names
         """
         libs = []
+        # 在所有的数据库中遍历
         for db in self._conn.database_names():
+            # 如果以arctic_开始的，则将以ARCTIC为结尾的表加入进去
             if db.startswith(self.DB_PREFIX + '_'):
                 for coll in self._conn[db].collection_names():
                     if coll.endswith(self.METADATA_COLL):
+                        # 这个加入的就是自定义的表名，比如test.chunkstores将会被系统存储为arctic_test.chunkstores.ARCTIC
                         libs.append(db[len(self.DB_PREFIX) + 1:] + "." + coll[:-1 * len(self.METADATA_COLL) - 1])
             elif db == self.DB_PREFIX:
+                # 如果db等于arctic的database，并且以ARCTIC结尾的表，则.之前就是lib名
                 for coll in self._conn[db].collection_names():
                     if coll.endswith(self.METADATA_COLL):
                         libs.append(coll[:-1 * len(self.METADATA_COLL) - 1])
@@ -196,14 +200,20 @@ class Arctic(object):
         kwargs :
             Arguments passed to the Library type for initialization.
         """
+        # 绑定了数据库和library的实例
         l = ArcticLibraryBinding(self, library)
         # Check that we don't create too many namespaces
+        # 该数据库中的表 如果超过3000
         if len(self._conn[l.database_name].collection_names()) > 3000:
             raise ArcticException("Too many namespaces %s, not creating: %s" %
                                   (len(self._conn[l.database_name].collection_names()), library))
+        # 设置library的元信息，chunkstores.ARCTIC 前者是创建的library，存储了ARCTIC_META文档，TYPE字段为比如ChunkStoreV1
+        # 在这里设置数据后，就创建了database和对应的子表
         l.set_library_type(lib_type)
-        LIBRARY_TYPES[lib_type].initialize_library(l, **kwargs)
+        # 使用比如ChunkStore来初始化
+        LIBRARY_TYPES[lib_type].initialize_library(l)
         # Add a 10G quota just in case the user is calling this with API.
+        # 如果没有限额，则设置一个10G的限额
         if not l.get_quota():
             l.set_quota(10 * 1024 * 1024 * 1024)
 
@@ -239,6 +249,7 @@ class Arctic(object):
         library : `str`
             The name of the library. e.g. 'library' or 'user.library'
         """
+        # 返回的是不同store的实例，后面的write和read都是在这些实例的基础上进行的
         if library in self._library_cache:
             return self._library_cache[library]
 
@@ -258,10 +269,14 @@ class Arctic(object):
         elif lib_type not in LIBRARY_TYPES:
             raise LibraryNotFoundException("Couldn't load LibraryType '%s' for '%s' (has the class been registered?)" %
                                            (lib_type, library))
+        # 实例化一个对应存储类型的实例，接受一个ArcticLibraryBinding对象
         instance = LIBRARY_TYPES[lib_type](l)
+        # 然后将这个library获得的实例缓存下来以便后面使用
         self._library_cache[library] = instance
         # The library official name may be different from 'library': e.g. 'library' vs 'user.library'
         self._library_cache[l.get_name()] = instance
+        # 返回的是一个比如ChunkStore实例，所以后面可以使用这个实例的_arctic_lib做一些操作
+        # 比如我可以将数据库中的开始和结束日期写入到metadata里面，随时更新
         return self._library_cache[library]
 
     def __getitem__(self, key):
@@ -380,9 +395,12 @@ class ArcticLibraryBinding(object):
         Returns the canonical (database_name, library) for the passed in
         string 'library'.
         """
+        # 最多分割2次.，clz.DB_PREFIX是arctic
         database_name = library.split('.', 2)
         if len(database_name) == 2:
             library = database_name[1]
+            # 如果library name是一个点分割的，那么后面的是library名字，前面的是数据库名字
+            # 比如arctic.chunksotres, database_name是arctic，library是chunkstores
             if database_name[0].startswith(clz.DB_PREFIX):
                 database_name = database_name[0]
             else:
@@ -393,19 +411,25 @@ class ArcticLibraryBinding(object):
 
     def __init__(self, arctic, library):
         self.arctic = arctic
+        # 解析符合要求的library名字和database名字
         database_name, library = self._parse_db_lib(library)
         self.library = library
         self.database_name = database_name
+        # 初始化的时候出发获取db和auth这些
+        # 本质这个方法用于获取存储数据的collection，lazy获取，主要是获取链接
         self.get_top_level_collection()  # Eagerly trigger auth
 
     @property
     def _db(self):
+        # 获取指定名字的database，参考pymongo的用法
+        # 只是获取数据库链接，但是还没有创建数据库，因为都是lazy的
         db = self.arctic._conn[self.database_name]
         self._auth(db)
         return db
 
     @property
     def _library_coll(self):
+        # 获取相应database中的library, lazy版的collection，获取这个名字的collection
         return self._db[self.library]
 
     def __str__(self):
@@ -423,7 +447,7 @@ class ArcticLibraryBinding(object):
 
     @mongo_retry
     def _auth(self, database):
-        #Get .mongopass details here
+        # Get .mongopass details here
         if not hasattr(self.arctic, 'mongo_host'):
             return
 
@@ -437,7 +461,7 @@ class ArcticLibraryBinding(object):
     def get_top_level_collection(self):
         """
         Return the top-level collection for the Library.  This collection is to be used
-        for storing data.  
+        for storing data.
 
         Note we expect (and callers require) this collection to have default read-preference: primary
         The read path may choose to reduce this if secondary reads are allowed.
@@ -479,6 +503,7 @@ class ArcticLibraryBinding(object):
             return
 
         # Figure out whether the user has exceeded their quota
+        # 返回当前绑定相应实例的library
         library = self.arctic[self.get_name()]
         stats = library.stats()
 
@@ -490,9 +515,9 @@ class ArcticLibraryBinding(object):
         count = stats['totals']['count']
         if size >= self.quota:
             raise QuotaExceededException("Mongo Quota Exceeded: %s %.3f / %.0f GB used" % (
-                                         '.'.join([self.database_name, self.library]),
-                                         to_gigabytes(size),
-                                         to_gigabytes(self.quota)))
+                '.'.join([self.database_name, self.library]),
+                to_gigabytes(size),
+                to_gigabytes(self.quota)))
 
         # Quota not exceeded, print an informational message and return
         avg_size = size // count if count > 1 else 100 * 1024
@@ -500,14 +525,14 @@ class ArcticLibraryBinding(object):
         remaining_count = remaining / avg_size
         if remaining_count < 100 or float(remaining) / self.quota < 0.1:
             logger.warning("Mongo Quota: %s %.3f / %.0f GB used" % (
-                            '.'.join([self.database_name, self.library]),
-                            to_gigabytes(size),
-                            to_gigabytes(self.quota)))
+                '.'.join([self.database_name, self.library]),
+                to_gigabytes(size),
+                to_gigabytes(self.quota)))
         else:
             logger.info("Mongo Quota: %s %.3f / %.0f GB used" % (
-                            '.'.join([self.database_name, self.library]),
-                            to_gigabytes(size),
-                            to_gigabytes(self.quota)))
+                '.'.join([self.database_name, self.library]),
+                to_gigabytes(size),
+                to_gigabytes(self.quota)))
 
         # Set-up a timer to prevent us for checking for a few writes.
         # This will check every average half-life

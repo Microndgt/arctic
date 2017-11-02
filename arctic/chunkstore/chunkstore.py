@@ -18,7 +18,6 @@ from .passthrough_chunker import PassthroughChunker
 
 from ..exceptions import NoDataFoundException
 
-
 logger = logging.getLogger(__name__)
 
 CHUNK_STORE_TYPE = 'ChunkStoreV1'
@@ -43,15 +42,16 @@ CHUNKER_MAP = {DateChunker.TYPE: DateChunker(),
 
 class ChunkStore(object):
     @classmethod
-    def initialize_library(cls, arctic_lib, **kwargs):
+    def initialize_library(cls, arctic_lib):
         ChunkStore(arctic_lib)._ensure_index()
 
     @mongo_retry
     def _ensure_index(self):
+        # 在symbols子collection中创建symbol自增索引
         self._symbols.create_index([(SYMBOL, pymongo.ASCENDING)],
                                    unique=True,
                                    background=True)
-
+        # 创建索引后，这些collection就会被创建，但是是没有数据的，不过所有的索引都被建立好了
         self._collection.create_index([(SYMBOL, pymongo.HASHED)],
                                       background=True)
         self._collection.create_index([(SYMBOL, pymongo.ASCENDING),
@@ -72,10 +72,10 @@ class ChunkStore(object):
                                   (END, pymongo.ASCENDING)],
                                  unique=True, background=True)
 
-    def __init__(self, arctic_lib):
+    def __init__(self, arctic_lib, chunker=DateChunker()):
         self._arctic_lib = arctic_lib
         self.serializer = FrametoArraySerializer()
-
+        self.chunker = chunker
         # Do we allow reading from secondaries
         self._allow_secondary = self._arctic_lib.arctic._allow_secondary
         self._reset()
@@ -83,7 +83,9 @@ class ChunkStore(object):
     @mongo_retry
     def _reset(self):
         # The default collection
+        # 获取存储数据的collection
         self._collection = self._arctic_lib.get_top_level_collection()
+        # 获取主存储数据的子collection
         self._symbols = self._collection.symbols
         self._mdata = self._collection.metadata
         self._audit = self._collection.audit
@@ -146,7 +148,9 @@ class ChunkStore(object):
             self._symbols.replace_one({SYMBOL: symbol}, sym)
 
         else:
-            query = {SYMBOL: symbol}
+            if isinstance(symbol, str):
+                symbol = [symbol]
+            query = {SYMBOL: {'$in': symbol}}
             self._collection.delete_many(query)
             self._symbols.delete_many(query)
             self._mdata.delete_many(query)
@@ -181,6 +185,8 @@ class ChunkStore(object):
 
     def _get_symbol_info(self, symbol):
         if isinstance(symbol, list):
+            # $in操作符 查询字段在symbol中的所有文档
+            # 在symbol中查询
             return list(self._symbols.find({SYMBOL: {'$in': symbol}}))
         return self._symbols.find_one({SYMBOL: symbol})
 
@@ -219,8 +225,7 @@ class ChunkStore(object):
             audit['old_symbol'] = from_symbol
             self._audit.insert_one(audit)
 
-
-    def read(self, symbol, chunk_range=None, filter_data=True, **kwargs):
+    def read(self, symbol=None, chunk_range=None, filter_data=True, **kwargs):
         """
         Reads data for a given symbol from the database.
 
@@ -233,6 +238,8 @@ class ChunkStore(object):
             DateChunker it is a DateRange object or a DatetimeIndex,
             as returned by pandas.date_range
         filter_data: boolean
+            是否过滤数据，如果过滤的话，就会返回特定的chunk_range指定的数据
+            如果是否，则返回对应的chunk，而不过滤
             perform chunk level filtering on the data (see filter in _chunker)
             only applicable when chunk_range is specified
         kwargs: ?
@@ -240,20 +247,25 @@ class ChunkStore(object):
 
         Returns
         -------
-        DataFrame or Series, or in the case when multiple symbols are given, 
+        DataFrame or Series, or in the case when multiple symbols are given,
         returns a dict of symbols (symbol -> dataframe/series)
         """
-        if not isinstance(symbol, list):
-            symbol = [symbol]
+        # 查询过程就是 按照股票列表in查询，还有chunk_range
+        if not symbol:
+            # 如果没有选择symbol就直接全部查询
+            spec = {}
+        else:
+            if not isinstance(symbol, list):
+                symbol = [symbol]
 
-        sym = self._get_symbol_info(symbol)
-        if not sym:
-            raise NoDataFoundException('No data found for %s' % (symbol))
+            sym = self._get_symbol_info(symbol)
+            if not sym:
+                raise NoDataFoundException('No data found for %s' % (symbol))
 
-        
-        spec = {SYMBOL: {'$in': symbol}}
-        chunker = CHUNKER_MAP[sym[0][CHUNKER]]
-        deser = SER_MAP[sym[0][SERIALIZER]].deserialize
+            spec = {SYMBOL: {'$in': symbol}}
+
+        chunker = self.chunker
+        deser = self.serializer.deserialize
 
         if chunk_range is not None:
             spec.update(chunker.to_mongo(chunk_range))
@@ -261,6 +273,7 @@ class ChunkStore(object):
         by_start_segment = [(SYMBOL, pymongo.ASCENDING),
                             (START, pymongo.ASCENDING),
                             (SEGMENT, pymongo.ASCENDING)]
+        # 搜索按照symbol和date_range，因此每一项就是对于多个segments组合的数据
         segment_cursor = self._collection.find(spec, sort=by_start_segment)
 
         chunks = defaultdict(list)
@@ -275,13 +288,14 @@ class ChunkStore(object):
             chunk_data = b''.join([doc[DATA] for doc in segments])
             chunks[segments[0][SYMBOL]].append({DATA: chunk_data, METADATA: mdata})
 
-
         skip_filter = not filter_data or chunk_range is None
-        
+
         if len(symbol) > 1:
-            return {sym: deser(chunks[sym], **kwargs) if skip_filter else chunker.filter(deser(chunks[sym], **kwargs), chunk_range) for sym in symbol}
+            return {sym: deser(chunks[sym], **kwargs) if skip_filter else chunker.filter(deser(chunks[sym], **kwargs),
+                                                                                         chunk_range) for sym in symbol}
         else:
-            return deser(chunks[symbol[0]], **kwargs) if skip_filter else chunker.filter(deser(chunks[symbol[0]], **kwargs), chunk_range)
+            return deser(chunks[symbol[0]], **kwargs) if skip_filter else chunker.filter(
+                deser(chunks[symbol[0]], **kwargs), chunk_range)
 
     def read_audit_log(self, symbol=None):
         """
@@ -300,7 +314,7 @@ class ChunkStore(object):
             return [x for x in self._audit.find({'symbol': symbol}, {'_id': False})]
         return [x for x in self._audit.find({}, {'_id': False})]
 
-    def write(self, symbol, item, metadata=None, chunker=DateChunker(), audit=None, **kwargs):
+    def write(self, symbol, item, metadata=None, audit=None, **kwargs):
         """
         Writes data from item to symbol in the database
 
@@ -312,8 +326,6 @@ class ChunkStore(object):
             the data to write the database
         metadata: ?
             optional per symbol metadata
-        chunker: Object of type Chunker
-            A chunker that chunks the data in item
         audit: dict
             audit information
         kwargs:
@@ -334,11 +346,16 @@ class ChunkStore(object):
         doc[SYMBOL] = symbol
         doc[LEN] = len(item)
         doc[SERIALIZER] = self.serializer.TYPE
-        doc[CHUNKER] = chunker.TYPE
+        doc[CHUNKER] = self.chunker.TYPE
         doc[USERMETA] = metadata
 
         sym = self._get_symbol_info(symbol)
+        # 查询数据库是否有该symbol信息
+        # 摘要算法又称哈希算法、散列算法。它通过一个函数，把任意长度的数据转换为一个长度固定的数据串（通常用16进制的字符串表示）
+        # 目的是为了发现原始数据是否被人篡改过
         if sym:
+            # projection：在结果集中应该被返回的字段列表，或者是应该包含或者排序的字段字典，如果是列表_id将总是被返回
+            # 这里可能是多个chunk的shas
             previous_shas = set([Binary(x[SHA]) for x in self._collection.find({SYMBOL: symbol},
                                                                                projection={SHA: True, '_id': False},
                                                                                )])
@@ -346,28 +363,42 @@ class ChunkStore(object):
         meta_ops = []
         chunk_count = 0
 
-        for start, end, chunk_size, record in chunker.to_chunks(item, **kwargs):
+        for start, end, chunk_size, record in self.chunker.to_chunks(item, **kwargs):
             chunk_count += 1
+            # 经过chunker分组后的分组数据
+            # 下面是经过序列化之后的metadata
+            # {COLUMNS: columns,
+            #  MASK: masks,
+            #  LENGTHS: lengths,
+            #  DTYPE: dtypes
+            #  }
             data = self.serializer.serialize(record)
             doc[CHUNK_SIZE] = chunk_size
             doc[METADATA] = {'columns': data[METADATA][COLUMNS] if COLUMNS in data[METADATA] else ''}
             meta = data[METADATA]
 
+            # 对分块的每一份数据，因为可能大于最大分块长度，所以要按照最大分块长度分块
+            # 相当于对于一个symbol，start，end可能对于多个segments
             for i in xrange(int(len(data[DATA]) / MAX_CHUNK_SIZE + 1)):
                 chunk = {DATA: Binary(data[DATA][i * MAX_CHUNK_SIZE: (i + 1) * MAX_CHUNK_SIZE])}
                 chunk[SEGMENT] = i
                 chunk[START] = meta[START] = start
                 chunk[END] = meta[END] = end
                 chunk[SYMBOL] = meta[SYMBOL] = symbol
-                dates = [chunker.chunk_to_str(start), chunker.chunk_to_str(end), str(chunk[SEGMENT]).encode('ascii')]
+                dates = [self.chunker.chunk_to_str(start), self.chunker.chunk_to_str(end), str(chunk[SEGMENT]).encode('ascii')]
                 chunk[SHA] = self._checksum(dates, chunk[DATA])
 
+                # upsert为True，则如果没有找到document，就插入一个document
+                # 存入meta数据，符合symbol, start, end的数据
+                # 这里只是一个ReplaceOne操作实例，还没有被执行，所以相当于命令设计模式，可以撤销
                 meta_ops.append(pymongo.ReplaceOne({SYMBOL: symbol,
                                                     START: start,
                                                     END: end},
                                                    meta, upsert=True))
 
+                # 如果本次chunk的SHA和以前的不一样，则更新数据，chunk包含所有的数据
                 if chunk[SHA] not in previous_shas:
+                    # 这里set，也就是更新整个文档，这个文档包含了所有要更新的键，比如chunk[SYMBOL]
                     ops.append(pymongo.UpdateOne({SYMBOL: symbol,
                                                   START: start,
                                                   END: end,
@@ -378,6 +409,7 @@ class ChunkStore(object):
                     previous_shas.remove(chunk[SHA])
 
         if ops:
+            # 向服务器发送写请求的集合
             self._collection.bulk_write(ops, ordered=False)
         if meta_ops:
             self._mdata.bulk_write(meta_ops, ordered=False)
@@ -386,6 +418,7 @@ class ChunkStore(object):
         doc[APPEND_COUNT] = 0
 
         if previous_shas:
+            # 删除仍然剩余的shas的symbol数据
             mongo_retry(self._collection.delete_many)({SYMBOL: symbol, SHA: {'$in': list(previous_shas)}})
 
         mongo_retry(self._symbols.update_one)({SYMBOL: symbol},
@@ -442,7 +475,7 @@ class ChunkStore(object):
 
             data = SER_MAP[sym[SERIALIZER]].serialize(record)
             meta = data[METADATA]
-            
+
             chunk_count = int(len(data[DATA]) / MAX_CHUNK_SIZE + 1)
             seg_count = self._collection.count({SYMBOL: symbol, START: start, END: end})
             # remove old segments for this chunk in case we now have less
@@ -452,7 +485,6 @@ class ChunkStore(object):
                                               START: start,
                                               END: end,
                                               SEGMENT: {'$gte': chunk_count}})
-
 
             for i in xrange(chunk_count):
                 chunk = {DATA: Binary(data[DATA][i * MAX_CHUNK_SIZE: (i + 1) * MAX_CHUNK_SIZE])}
@@ -550,9 +582,11 @@ class ChunkStore(object):
         if chunk_range is not None:
             if len(CHUNKER_MAP[sym[CHUNKER]].filter(item, chunk_range)) == 0:
                 raise Exception('Range must be inclusive of data')
-            self.__update(sym, item, metadata=metadata, combine_method=self.serializer.combine, chunk_range=chunk_range, audit=audit)
+            self.__update(sym, item, metadata=metadata, combine_method=self.serializer.combine, chunk_range=chunk_range,
+                          audit=audit)
         else:
-            self.__update(sym, item, metadata=metadata, combine_method=lambda old, new: new, chunk_range=chunk_range, audit=audit)
+            self.__update(sym, item, metadata=metadata, combine_method=lambda old, new: new, chunk_range=chunk_range,
+                          audit=audit)
 
     def get_info(self, symbol):
         """
@@ -714,7 +748,8 @@ class ChunkStore(object):
             sharding = conn.config.databases.find_one({'_id': db.name})
             if sharding:
                 res['sharding'].update(sharding)
-            res['sharding']['collections'] = list(conn.config.collections.find({'_id': {'$regex': '^' + db.name + r"\..*"}}))
+            res['sharding']['collections'] = list(
+                conn.config.collections.find({'_id': {'$regex': '^' + db.name + r"\..*"}}))
         except OperationFailure:
             # Access denied
             pass
@@ -724,7 +759,7 @@ class ChunkStore(object):
         res['metadata'] = db.command('collstats', self._mdata.name)
         res['totals'] = {'count': res['chunks']['count'],
                          'size': res['chunks']['size'] + res['symbols']['size'] + res['metadata']['size'],
-                        }
+                         }
         return res
 
     def has_symbol(self, symbol):
@@ -741,3 +776,24 @@ class ChunkStore(object):
         bool
         '''
         return self._get_symbol_info(symbol) is not None
+
+    def get_data_range(self):
+        start = self._arctic_lib.get_library_metadata(START)
+        end = self._arctic_lib.get_library_metadata(END)
+        return start, end
+
+    def set_data_range(self, data_range):
+        """
+        设置全局的data日期范围
+        :param data_range:
+        :return:
+        """
+        start, end = data_range
+        self._arctic_lib.set_library_metadata(START, start)
+        self._arctic_lib.set_library_metadata(END, end)
+
+    def set_data_fields(self, fields):
+        self._arctic_lib.set_library_metadata(USERMETA, fields)
+
+    def get_data_fields(self):
+        return self._arctic_lib.get_library_metadata(USERMETA)

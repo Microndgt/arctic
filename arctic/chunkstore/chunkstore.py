@@ -254,6 +254,7 @@ class ChunkStore(object):
         if not symbol:
             # 如果没有选择symbol就直接全部查询
             spec = {}
+            symbol = [sym[SYMBOL] for sym in self._symbols.find(projection={SYMBOL: True, '_id': False})]
         else:
             if not isinstance(symbol, list):
                 symbol = [symbol]

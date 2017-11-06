@@ -130,22 +130,28 @@ class ChunkStore(object):
             sym = self._get_symbol_info(symbol)
             # read out chunks that fall within the range and filter out
             # data within the range
+            # 首先会查找这一data_range的数据，而且不进行过滤，即会拿出整个chunk的数据
             df = self.read(symbol, chunk_range=chunk_range, filter_data=False)
-            row_adjust = len(df)
-            df = CHUNKER_MAP[sym[CHUNKER]].exclude(df, chunk_range)
+            # 因此这里有一个bug，就是如果这个chunk_range本身在mongodb中不存在
+            # 那么这里调用update就有问题，因此如果没有df的话就return
+            if not df.empty:
+                row_adjust = len(df)
+                # 然后排除需要删除的data_range的数据
+                df = CHUNKER_MAP[sym[CHUNKER]].exclude(df, chunk_range)
 
-            # remove chunks, and update any remaining data
-            query = {SYMBOL: symbol}
-            query.update(CHUNKER_MAP[sym[CHUNKER]].to_mongo(chunk_range))
-            self._collection.delete_many(query)
-            self._mdata.delete_many(query)
-            self.update(symbol, df)
+                # remove chunks, and update any remaining data
+                # 然后将mongodb的这几个chunk的数据全部删除，然后重新写入
+                query = {SYMBOL: symbol}
+                query.update(CHUNKER_MAP[sym[CHUNKER]].to_mongo(chunk_range))
+                self._collection.delete_many(query)
+                self._mdata.delete_many(query)
+                self.update(symbol, df)
 
-            # update symbol metadata (rows and chunk count)
-            sym = self._get_symbol_info(symbol)
-            sym[LEN] -= row_adjust
-            sym[CHUNK_COUNT] = self._collection.count({SYMBOL: symbol})
-            self._symbols.replace_one({SYMBOL: symbol}, sym)
+                # update symbol metadata (rows and chunk count)
+                sym = self._get_symbol_info(symbol)
+                sym[LEN] -= row_adjust
+                sym[CHUNK_COUNT] = self._collection.count({SYMBOL: symbol})
+                self._symbols.replace_one({SYMBOL: symbol}, sym)
 
         else:
             if isinstance(symbol, str):

@@ -13,7 +13,7 @@ try:
 except ImportError:
     from pandas.lib import max_len_string_array
 
-from bson import Binary, SON
+from bson import Binary, SON, BSON
 
 from .._compression import compress, decompress, compress_array
 from ._serializer import Serializer
@@ -51,6 +51,7 @@ class FrameConverter(object):
         Converts object arrays of strings to numpy string arrays
         """
         # No conversion for scalar type
+        # dtype('O')
         if a.dtype != 'object':
             return a, None
 
@@ -61,9 +62,12 @@ class FrameConverter(object):
 
         # Compute a mask of missing values. Replace NaNs and Nones with
         # empty strings so that type inference has a chance.
+        # 判断a数组中是否有NULL值
         mask = pd.isnull(a)
+        # 如果有NULL值，
         if mask.sum() > 0:
             a = a.copy()
+            # a的大小要和mask对应，这样mask为True对应a的值，将会被替换为 ''
             np.putmask(a, mask, '')
         else:
             mask = None
@@ -78,7 +82,9 @@ class FrameConverter(object):
 
         type_ = infer_dtype(a)
         if type_ in ['unicode', 'string']:
+            # 最大长度
             max_len = max_len_string_array(a)
+            # 将其转换成指定的类型
             return a.astype('U{:d}'.format(max_len)), mask
         else:
             raise ValueError('Cannot store arrays with {} dtype'.format(type_))
@@ -101,11 +107,22 @@ class FrameConverter(object):
 
         arrays = []
         for c in df:
+            # 迭代的是列名
             try:
+                # df[c]则获取该列的所有值
                 columns.append(str(c))
+                # df[c].values将其转换成一个array对象, numpy.ndarray
+                # 这个函数的作用就是，推断df[c]的类型和长度，以及是否为None，传回来一个mask
+                # 并且将数据转换成指定的类型，
+                # 比如对于SYMBOL列，array(['600000_CNSESH', '600004_CNSESH', '600005_CNSESH', ...,
+                #  '300586_CNSESZ', '300587_CNSESZ', '300588_CNSESZ'],
+                # dtype='<U13')
+                # mask是一个True，False的数组，或者是一个None
                 arr, mask = self._convert_types(df[c].values)
+                # 记录列名对应的类型信息
                 dtypes[str(c)] = arr.dtype.str
                 if mask is not None:
+                    # 记录NULL值信息
                     masks[str(c)] = Binary(compress(mask.tostring()))
                 arrays.append(arr.tostring())
             except Exception as e:
@@ -113,10 +130,12 @@ class FrameConverter(object):
                 msg = "Column '{}' type is {}".format(str(c), typ)
                 logging.info(msg)
                 raise e
-
+        # arrays是包含所有列的数据字符串
         arrays = compress_array(arrays)
         for index, c in enumerate(df):
+            # 将每列的字符串数据转换成Binary
             d = Binary(arrays[index])
+            # 记录长度信息
             lengths[str(c)] = (start, start + len(d) - 1)
             start += len(d)
             data += d
@@ -150,11 +169,33 @@ class FrameConverter(object):
         return pd.DataFrame(data, columns=cols)[cols]
 
 
+class FastFrameConverter(FrameConverter):
+    def docify(self, df):
+        """
+        将Pandas的DataFrame转换成列表字典
+
+        :param df:
+        :return:
+        """
+        data = df.to_dict(orient='records')
+        return SON({DATA: data, METADATA: {}})
+
+    def objify(self, doc, columns=None):
+        """
+        将一个SON对象转换成Pandas的DataFrame
+
+        :param doc:
+        :param columns:
+        :return:
+        """
+        return pd.DataFrame(doc[DATA])
+
+
 class FrametoArraySerializer(Serializer):
     TYPE = 'FrameToArray'
 
-    def __init__(self):
-        self.converter = FrameConverter()
+    def __init__(self, converter=None):
+        self.converter = converter or FrameConverter()
 
     def serialize(self, df):
         if isinstance(df, pd.Series):
@@ -166,10 +207,15 @@ class FrametoArraySerializer(Serializer):
         if (len(df.index.names) > 1 and None in df.index.names) or None in list(df.columns.values):
             raise Exception("All columns and indexes must be named")
 
+        # 处理有关index的东西
         if df.index.names != [None]:
             index = df.index.names
+            # 将index值转换成一列，然后创建一个简单的数字索引
+            # 也就是说date必须是df的一列
             df = df.reset_index()
+            # 开始序列化
             ret = self.converter.docify(df)
+            # 所以这里元信息要加上index信息
             ret[METADATA][INDEX] = index
             ret[METADATA][TYPE] = dtype
             return ret

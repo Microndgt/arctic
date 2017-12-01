@@ -3,11 +3,19 @@ import numpy as np
 import pytest
 from pandas.util.testing import assert_frame_equal
 
-from arctic.serialization.numpy_arrays import FrameConverter, FrametoArraySerializer
+from arctic.serialization.numpy_arrays import FrameConverter, FrametoArraySerializer, FastFrameConverter
 
 
 def test_frame_converter():
     f = FrameConverter()
+    df = pd.DataFrame(np.random.randint(0, 100, size=(100, 4)),
+                      columns=list('ABCD'))
+
+    assert_frame_equal(f.objify(f.docify(df)), df)
+
+
+def test_fast_frame_converter():
+    f = FastFrameConverter()
     df = pd.DataFrame(np.random.randint(0, 100, size=(100, 4)),
                       columns=list('ABCD'))
 
